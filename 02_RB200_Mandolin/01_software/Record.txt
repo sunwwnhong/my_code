@@ -1,0 +1,101 @@
+===========================开发记录=================================
+基于TI的demo板实现任务目标：
+00. 三核CPU运行
+01. CPU1 & CPU 2 基本框架搭建完成【20221029】--OK
+02. 定时器中断测试正常【20221030】--OK
+03. 普通GPIO在双CPU中分配使用，Output【20221030】--OK
+04. QEP在双CPU中计数(AB,脉冲+方向,CCW+CW)【20221101】--OK
+05. 双CPU实现数据共享【20221102】--OK
+06. 双CPU串口UART独立工作【20221102】--OK
+07. 双CPU实现独立IIC操作【20221104】--OK
+08. 双CPU实现独立Can,CPU1基于MCAN,CPU2基于标准Can【20221111】--OK
+09. ePWM【20221111】--OK
+10. TZ1 & TZ2,以及中断信号辨别 【20221111】--OK
+11. ADC(模拟量数字量转换,母线电压,模块温度)【20221111】--OK
+12. CLA协处理器通过ADC中断触发【20221112】--OK
+13. 外部中断以及中断信号源生成(ECAP)【20221114】--OK
+14. 中断嵌套与任务同步【20221115】--OK
+15. USB 数据/任务收发【20221125】--OK
+16. CLB(串行编码器解码)【20221128】--OK
+17. EtherCAT 外设驱动 【20221206】--OK
+18. EtherCAT 新版本协议栈,实现1对N【20221209】--OK
+19. MCAN 无法使用FIFO发送以及ID滤波功能【20221216】--OK
+20. USB时钟和EtherCAT时钟同时配置异常问题【20221216】--OK
+21. 模拟量ADC分组触发采样【20221219】--OK
+22.	多个TRIP信号处理问题【20221221】--OK
+23. PWM 自举功能实现【20221223】--OK
+24. CPU 通过串口烧录或更新程序裸片程序【20221223】--OK
+25. CPU2 编码器采样问题【20221225】--OK
+26. GPIO引脚滤波问题【20221226】--OK
+27. 软件复位【20230109】--OK
+28. 芯片温度【20230109】--OK
+29. 软件系统综合  【20221230】--OK
+30. 系统日期与时间显示【20230112】--OK
+31. USB通讯读取数据异常完善【20230107】--OK
+32. 多摩川编码器中Eeprom数据读、写、编码器错误清除【20230108】--OK
+33. ACR实现【OK】
+34. 运算效率提升【OK】
+35. CPU2传送数据至CLA1问题【OK】
+36. 芯片双区双引导(USB更新)【OK】
+37. 三核协同工作
+
+
+31.CLB(分频输出) 后续根据需要开发
+
+搭载实物实现任务目标：
+00. 软件系统综合验证
+01. 三电阻电流采样(下桥)
+
+问题点记录：
+1、为了后续方便,将RASLS0 ~ RAMLS5 合并到一起 RAMLS0_to_LS5;
+2、 EtherCAT Product Code  1 轴:0x10100036
+				  		  2 轴:0x10100046
+
+===========================注意事项=================================
+1、GPIO72和GPIO84是Boot启动引脚
+2、InputBar 使用情况
+	InputBar1: Tz1 【MotA】
+	InputBar2: Tz2 【MotA】
+	InputBar3: 
+	InputBar4: 外部中断INT1
+	InputBar5: 外部中断INT2
+	InputBar6: 
+	InputBar7: 编码器A
+	InputBar8: 编码器B
+	InputBar9: 
+	InputBar10:
+	InputBar11: Trip11【MOTB】
+	InputBar12: Trip12【MOTB】
+3、OutputBar 使用情况
+	OutputBar1:
+	OutputBar2:
+	OutputBar3: 62.5us中断
+	OutputBar4: 125us 中断
+	OutputBar5:
+	OutputBar6:
+	
+===========================Cmd=================================
+RAMGS0:CPU1	
+	
+===========================注意事项=================================	
+1、需要1ms运行一次,ECAT_TIMER_INC_P_MS 存在bug
+            UINT32 CurTimer = (UINT32)HW_GetTimer();
+
+            if(CurTimer>= ECAT_TIMER_INC_P_MS)
+            {
+                ECAT_CheckTimer();
+
+                HW_ClearTimer();
+            }
+2、LED 灯是否需要显示 ECAT_SetLedIndication	
+
+3、有问题            if ( SMLength == 24 && nPdOutputSize != 0 && SMLength <= ((UINT16)MAX_PD_OUTPUT_SIZE))
+4、    UINT16 Mot2ObjFlag = 0;
+    UINT32 AddressOffSet = pObjEntry->pVarPtr;
+    if( AddressOffSet >= 0x0003A000 && AddressOffSet <= 0x0003A064 )
+    {
+        Mot2ObjFlag = 1;
+    }
+5、#define MCAN_MAX_PAYLOAD_BYTES (64U)    长度是否需要调整
+
+	

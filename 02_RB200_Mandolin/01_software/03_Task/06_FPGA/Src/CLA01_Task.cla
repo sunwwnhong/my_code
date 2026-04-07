@@ -1,0 +1,620 @@
+/*************** (C) COPYRIGHT 2024  Veichi Technology Co., Ltd*********************************
+* File Name          : CLA01_Task.cla
+* Version            : V0.1
+* Date               : 2024
+* Description        : CLA任务执行（该模块全部在CLA内部执行）
+***********************************************************************************************/
+  
+#ifdef CPU1
+#include "f28x_project.h"
+#include "CLA09_CLAVar.h"
+#include "CLAmath.h"
+ #define DeadTime 150
+ #define CLADebug    0
+
+#define Cur_ADC_Samp_Double1    0
+  
+/**********************************************************************************************/
+/* Function_Name: ACR_MainTask         */
+/* Description  : 电流控制器执行（PI+park反变换+SVPWM）
+                  调用：每个PWM周期执行一次，执行时间3~4us
+                  输入：Axis： 0：轴1  1：轴2
+                      PWMDir：PWM计数方向（0为正常）
+                  输出：   */
+/**********************************************************************************************/
+void ACR_MainTask( uint16_t Axis,uint16_t PWMDir )
+{
+    float fx1,fx2,fx3,fx4,fx5,fx6,fx7;
+    int16_t kx1,kx2,kx3;
+    CLA_VARDef LClaV;
+
+     /*1. LClaV输入接口参数获取*/
+    LClaV.Id_Cmd      = Acr_V.Id_Cmd;
+    LClaV.Iq_Cmd      = Acr_V.Iq_Cmd;
+    //LClaV.Id_Cmd      = Acr_V.Iq_Cmd;
+    //LClaV.Iq_Cmd      = Acr_V.Id_Cmd;
+    LClaV.CosVal      = Acr_V.CosVal;
+    LClaV.SinVal      = Acr_V.SinVal;
+    LClaV.MotWm       = Acr_V.MotWm;
+    LClaV.UqCmd       = Acr_V.UqCmd;
+    LClaV.VFtest       = Acr_V.VFtest;
+
+    LClaV.DQKiLimitMax  = Acr_P[0].DQKiLimitMax;
+    LClaV.DQKiLimitMin  = Acr_P[0].DQKiLimitMin;
+    LClaV.DQFilter      = Acr_P[0].DQFilter;
+    LClaV.PWMStatus     = AMotVar[0].PWMStatus;
+      
+    /*2. U,V,W三相电流采样与零偏补偿*/
+
+    //轴1：U,V,W下三桥采样（前半周期），下降计数时采集
+    if( PWMDir == 0 )
+    {
+        fx1 = (HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER0 ) + HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER1 )) >> 3;
+        fx2 = (HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER0 ) + HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER1 )) >> 3;
+        fx3 = (HWREGH( ADCCRESULT_BASE + ADC_SOC_NUMBER0 ) + HWREGH( ADCCRESULT_BASE + ADC_SOC_NUMBER1 )) >> 3;
+        AMotVar[ 0 ].Iuu = fx1;
+        AMotVar[ 0 ].Ivv = fx2;
+        AMotVar[ 0 ].Iww = fx3;
+    }
+    else
+    {
+        A1ToC1V.ACRUpdateErr ++;
+    }
+
+    fx1 = AMotVar[ 0 ].Iuu - Acr_I[0].AdcUZero;
+    fx2 = AMotVar[ 0 ].Ivv - Acr_I[0].AdcVZero;
+    fx3 = AMotVar[ 0 ].Iww - Acr_I[0].AdcWZero;
+
+    A1ToC1V.Monitor2 = fx1;
+    A1ToC1V.Monitor3 = fx2;
+    A1ToC1V.Monitor4 = fx3;
+
+    if( LClaV.PWMStatus == 1 )
+    {
+        AMotVar[0].Iu = -(fx2 + fx3);
+    }
+    else
+    {
+        AMotVar[0].Iu = fx1;
+    }
+
+
+    if( LClaV.PWMStatus == 2 )
+    {
+        AMotVar[0].Iv = -(fx1 + fx3);
+    }
+    else
+    {
+        AMotVar[0].Iv = fx2;
+    }
+
+    if( LClaV.PWMStatus == 4 )
+    {
+        AMotVar[0].Iw = -(fx1 + fx2);
+    }
+    else
+    {
+        AMotVar[0].Iw = fx3;
+    }
+
+    fx2 = AMotVar[0].Iv;
+    fx3 = AMotVar[0].Iw;
+
+    /*3. d，q轴反馈获取*/
+    //CLARK变换
+    fx1  =  (fx2 + fx3) * Acr_P[0].Cur_Coeff1;
+    fx2  =  (fx3 - fx2) * Acr_P[0].Cur_Coeff2;
+
+    //PARK变换
+    LClaV.Id_Fbk = fx1 * LClaV.CosVal + fx2 * LClaV.SinVal;
+    LClaV.Iq_Fbk = fx2 * LClaV.CosVal - fx1 * LClaV.SinVal;
+    AMotVar[0].IdFbk = LClaV.Id_Fbk;
+    AMotVar[0].IqFbk = LClaV.Iq_Fbk; //TODO
+
+
+     kx1 = ACR_Smachine  & 0x0001;
+     //PWM未使能，不执行ACR控制
+    if( kx1 == 0 )
+    {
+        AMotVar[0].IdCmdOld      = 0.0f;
+        AMotVar[0].IqCmdOld      = 0.0f;
+        AMotVar[0].IdKiSum       = 0.0f;
+        AMotVar[0].IqKiSum       = 0.0f;
+        AMotVar[0].PWMStatus     = 0;
+        AMotVar[0].Vd = 0.0f;
+        AMotVar[0].Vq = 0.0f;
+        CLAV.DFilter[0] = 0.0f;
+        CLAV.QFilter[0] = 0.0f;
+        /* 未使能状态下必须将PWM占空比映射值提前清零，避免使能瞬间电压变化过大导致过流*/
+        if( (Acr_V.PWMEn_Step  == 0) || (Acr_V.PWMEn_Step > 5))
+        {
+            HWREGH(0x306B) = 0;
+            HWREGH(0x326B) = 0;
+            HWREGH(0x346B) = 0;
+        }
+
+        return;
+    }
+    /*4. d，q轴PI调节*/
+    //最大电流误差钳制在Imax/5
+    fx1 = LClaV.Id_Cmd - LClaV.Id_Fbk;
+    fx1 = fx1 >  3000.0f ?  3000.0f : fx1;
+    fx1 = fx1 < -3000.0f ? -3000.0f : fx1;
+    fx2 = Acr_P[0].Cur_DKp * fx1;
+    fx3 = Acr_P[0].Cur_DKi * fx1;
+    AMotVar[0].IdKiSum += fx3; //TODO
+
+
+    fx4 = LClaV.DQKiLimitMax - fx2;
+    fx5 = LClaV.DQKiLimitMin - fx2;
+    AMotVar[0].IdKiSum = (AMotVar[0].IdKiSum > fx4) ? fx4 : AMotVar[0].IdKiSum; //TODO
+    AMotVar[0].IdKiSum = (AMotVar[0].IdKiSum < fx5) ? fx5 : AMotVar[0].IdKiSum;
+
+
+    LClaV.IdPiOut = fx2 + AMotVar[0].IdKiSum;
+
+
+    fx1 = LClaV.Iq_Cmd - LClaV.Iq_Fbk;
+    fx1 = fx1 >  3000.0f ?  3000.0f : fx1;
+    fx1 = fx1 < -3000.0f ? -3000.0f : fx1;
+    fx2 = Acr_P[0].Cur_QKp * fx1;
+    fx3 = Acr_P[0].Cur_QKi * fx1;
+    AMotVar[0].IqKiSum += fx3; //TODO
+
+
+    fx4 = LClaV.DQKiLimitMax - fx2;
+    fx5 = LClaV.DQKiLimitMin + fx2;
+    AMotVar[0].IqKiSum = (AMotVar[0].IqKiSum > fx4) ? fx4 : AMotVar[0].IqKiSum; //TODO
+    AMotVar[0].IqKiSum = (AMotVar[0].IqKiSum < fx5) ? fx5 : AMotVar[0].IqKiSum;
+
+
+    LClaV.IqPiOut = fx2 + AMotVar[0].IqKiSum;
+
+    /*4. d，q轴前馈解耦补偿*/
+    /*电流d，q轴解耦，ud=id*rs - Lq*iq*w+ Ld*id/dt
+    电流d，q轴解耦，uq=iq*rs + Ld*id*w+ Lq*iq/dt+ w*wf */
+#if 1
+    fx1 = Acr_P[0].RxComp * LClaV.Id_Cmd;
+    fx2 = Acr_P[0].RxComp * LClaV.Iq_Cmd;
+    fx3 = Acr_P[0].LdComp * LClaV.Iq_Cmd * LClaV.MotWm;
+    fx4 = Acr_P[0].LqComp * LClaV.Id_Cmd * LClaV.MotWm;
+#else
+    fx1 = Acr_P[Axis].RxComp * LClaV.Id_Fbk;
+    fx2 = Acr_P[Axis].RxComp * LClaV.Iq_Fbk;
+    fx3 = Acr_P[Axis].LdComp * LClaV.Iq_Fbk * LClaV.MotWm;
+    fx4 = Acr_P[Axis].LqComp * LClaV.Id_Fbk * LClaV.MotWm;
+#endif
+    fx5 = LClaV.MotWm * Acr_P[0].EmfCompCoeff;
+    //fx1 -= fx3;
+    //fx2 += (fx4 + fx5);
+ #if 0
+    fx1 = fx1 >  8192.0f ?  8192.0f : fx1;
+    fx1 = fx1 < -8192.0f ? -8192.0f : fx1;
+    fx2 = fx2 >  8192.0f ?  8192.0f : fx2;
+    fx2 = fx2 < -8192.0f ? -8192.0f : fx2;
+#endif
+    //d,q轴耦合项计算
+    LClaV.Vd = -fx3;                //  - Lq*iq*w
+    LClaV.Vq =  fx4 + fx5;          //  Lq*iq*w + w*wf
+
+#if 0
+    fx1 = LClaV.Id_Cmd - AMotVar[0].IdCmdOld;
+    fx2 = LClaV.Iq_Cmd - AMotVar[0].IqCmdOld;
+    AMotVar[0].IdCmdOld = LClaV.Id_Cmd; //TODO
+    AMotVar[0].IqCmdOld = LClaV.Iq_Cmd;
+    fx1 = fx1 * Acr_P[0].DDidt;
+    fx2 = fx2 * Acr_P[0].QDidt;
+    /*4. Ud、Uq获取与滤波*/
+    LClaV.Vd += fx1;
+    LClaV.Vq += fx2;
+#endif
+    LClaV.Vd = LClaV.Vd >  8192.0f ?  8192.0f : LClaV.Vd;
+    LClaV.Vd = LClaV.Vd < -8192.0f ? -8192.0f : LClaV.Vd;
+    LClaV.Vq = LClaV.Vq >  8192.0f ?  8192.0f : LClaV.Vq;
+    LClaV.Vq = LClaV.Vq < -8192.0f ? -8192.0f : LClaV.Vq;
+
+    //电压补偿环节计算
+    if(((LClaV.VFtest & 0x20) >> 5) == 1)
+    {
+        //Acr_P[0].VCompGain = 0;            //TODO
+        LClaV.Vd = 0;
+        LClaV.Vq = 0;
+    }
+    else
+    {
+        LClaV.Vd = LClaV.Vd * Acr_P[0].VCompGain;
+        LClaV.Vq = LClaV.Vq * Acr_P[0].VCompGain;
+    }
+
+    //Ud、Uq计算与滤波
+    LClaV.Vd += LClaV.IdPiOut;
+    LClaV.Vq += LClaV.IqPiOut;
+
+
+    LClaV.Vd = LClaV.Vd >  10430.0f ?  10430.0f : LClaV.Vd;
+    LClaV.Vd = LClaV.Vd < -10430.0f ? -10430.0f : LClaV.Vd;
+    LClaV.Vq = LClaV.Vq >  10430.0f ?  10430.0f : LClaV.Vq;
+    LClaV.Vq = LClaV.Vq < -10430.0f ? -10430.0f : LClaV.Vq;
+
+    //Ud/Uq低通滤波
+    //TODO
+
+    CLAV.DFilter[ 0 ] += ( LClaV.Vd - CLAV.DFilter[ 0 ] ) * LClaV.DQFilter;
+    CLAV.QFilter[ 0 ] += ( LClaV.Vq - CLAV.QFilter[ 0 ] ) * LClaV.DQFilter;
+
+    //Ud、Uq在1000范围外不进行滤波处理
+    if( (LClaV.Vd > 1000.0f) || (LClaV.Vd < -1000.0f))
+    {
+        fx3 = LClaV.Vd;
+        CLAV.DFilter[ 0 ] = LClaV.Vd;
+    }
+    else
+    {
+        fx3 = CLAV.DFilter[ 0 ];
+    }
+     if( (LClaV.Vq > 1000.0f) || (LClaV.Vq < -1000.0f))
+    {
+        fx4 = LClaV.Vq;
+        CLAV.QFilter[ 0 ] = LClaV.Vq;
+    }
+    else
+    {
+        fx4 = CLAV.QFilter[ 0 ];
+    }
+
+    fx3 = LClaV.Vd;
+    fx4 = LClaV.Vq;
+
+    //电压限制[-10430,10430]
+
+    fx3 = fx3 * ACRCom.UdcRatio;
+    fx4 = fx4 * ACRCom.UdcRatio;
+    fx3 = fx3 >  10430.0f ?  10430.0f : fx3;
+    fx3 = fx3 < -10430.0f ? -10430.0f : fx3;
+    fx4 = fx4 >  10430.0f ?  10430.0f : fx4;
+    fx4 = fx4 < -10430.0f ? -10430.0f : fx4;
+
+
+    fx1 = fx3 * fx3 + fx4 * fx4;
+
+    if( fx1 == 0.0f )
+    {
+        fx2 = 0.0f;
+    }
+    else
+    {
+        fx2 =  CLAisqrt_inline(fx1); // 1/sqrt(fx1)   //TODO
+    }
+
+
+    if( fx1 > 108784900.0f )
+    {
+        LClaV.Vd = fx3 * 10430.0f * fx2;
+        LClaV.Vq = fx4 * 10430.0f * fx2;
+    }
+    else
+    {
+        LClaV.Vd = fx3;
+        LClaV.Vq = fx4;
+    }
+
+    AMotVar[0].Vd = LClaV.Vd;      //TODO
+    AMotVar[0].Vq = LClaV.Vq;
+
+
+    /*4. 死区补偿大小获取*/
+    //Id、Iqcmd PARK反变换与CLARK反变换
+ #if 1
+    fx1 = LClaV.Id_Cmd * LClaV.CosVal - LClaV.Iq_Cmd * LClaV.SinVal;
+    fx2 = LClaV.Id_Cmd * LClaV.SinVal + LClaV.Iq_Cmd * LClaV.CosVal;
+    fx3 = fx1 * 0.5000000000f;
+    fx4 = fx2 * 0.8660254038f;
+#if 0
+    LClaV.Ia =   fx1;
+    LClaV.Ib =   fx4 - fx3;
+    LClaV.Ic =  -fx4 - fx3;
+#else
+    LClaV.Ia =   -fx1;
+    LClaV.Ib =   -fx4 + fx3;
+    LClaV.Ic =  fx4 + fx3;
+#endif
+     //死区补偿，将补偿值添加至U,V,W的比较值中
+     //电流范围在零点左右（Imax/150），按照当前的电流值进行补偿值计算
+    if( LClaV.Ia < 100.0f && LClaV.Ia > -100.0f )
+    {
+        kx1 = -LClaV.Ia * (float)DeadTime / 100.0f;
+    }
+    else
+    {
+        if( LClaV.Ia >= 0 )
+        {
+            kx1 = -DeadTime;
+        }
+        else
+        {
+            kx1 = DeadTime;
+        }
+    }
+
+    if( LClaV.Ib < 100.0f && LClaV.Ib > -100.0f )
+    {
+        kx2 = -LClaV.Ib * (float)DeadTime / 100.0f;
+    }
+    else
+    {
+        if( LClaV.Ib >= 0 )
+        {
+            kx2 = -DeadTime;
+        }
+        else
+        {
+            kx2 = DeadTime;
+        }
+    }
+    if( LClaV.Ic < 100.0f && LClaV.Ic > -100.0f )
+    {
+        kx3 = -LClaV.Ic * (float)DeadTime / 100.0f;
+    }
+    else
+    {
+        if( LClaV.Ic >= 0 )
+        {
+            kx3 = -DeadTime;
+        }
+        else
+        {
+            kx3 = DeadTime;
+        }
+    }
+#endif
+//   /*5. VF控制处理（仅限VF控制模式，用于调试验证）*/
+   if(((LClaV.VFtest & 0x0800) >> 11) == 1)
+   {
+     kx1 = 0;
+     kx2 = 0;
+     kx3 = 0;
+     LClaV.Vd = 0;
+     LClaV.Vq = LClaV.UqCmd;
+   }
+
+
+
+   /*6. SPWM + 三次谐波注入调制电压获取*/
+    //ualpha,ubeta计算（反PARK）
+    fx6 = LClaV.Vd * LClaV.CosVal - LClaV.Vq * LClaV.SinVal;
+    fx7 = LClaV.Vd * LClaV.SinVal + LClaV.Vq * LClaV.CosVal;
+
+
+    fx1 = fx6 * 0.5f;
+    fx2 = fx7 * 0.8660254038f;
+
+    //ua，ub，uc计算（反CLARK），获取SPWM
+    fx3 =        fx6;
+    fx4 =  fx2 - fx1;
+    fx5 = -fx2 - fx1;
+
+
+    //取最大和最小的向量
+    fx1 = ( fx3 > fx4 ) ? ( fx3 > fx5 ? fx3 : fx5 ) : ( fx4 > fx5 ? fx4 : fx5);
+    fx2 = ( fx3 < fx4 ) ? ( fx3 < fx5 ? fx3 : fx5 ) : ( fx4 < fx5 ? fx4 : fx5);
+
+    //均值零序分量注入：fx6中间向量值取1/2(SPWM等效SVPWM)
+    fx6 = ( fx1 + fx2) * 0.5f;
+    fx3 -= fx6;
+    fx4 -= fx6;
+    fx5 -= fx6; 		//syhu Notes:fx5 -= fx6;
+
+    fx3 = fx3 >  8192.0f ? 8192.0f :  fx3;
+    fx3 = fx3 < -8192.0f ? 0.0f    : (fx3 + 8192.0f);
+    fx4 = fx4 >  8192.0f ? 8192.0f :  fx4;
+    fx4 = fx4 < -8192.0f ? 0.0f    : (fx4 + 8192.0f);
+    fx5 = fx5 >  8192.0f ? 8192.0f :  fx5;
+    fx5 = fx5 < -8192.0f ? 0.0f    : (fx5 + 8192.0f);
+    fx1 = ACRCom.PWMPeriod;	//转换系数  电压->EPWM占空比
+
+    /*6. 死区补偿处理*/
+    if(((LClaV.VFtest & 0x10) >> 4) == 1)
+    {
+        kx1 = 0;
+        kx2 = 0;
+        kx3 = 0;
+    }
+
+    fx2 = fx3 * fx1 + ( float )kx1;
+    fx3 = fx4 * fx1 + ( float )kx2;
+    fx4 = fx5 * fx1 + ( float )kx3;
+
+    /*7. 下三桥采样占空比限制，避免采样异常*/
+    if( LClaV.MotWm > 8000.0f || LClaV.MotWm < -8000.0f )
+    {
+        fx6 = ACRCom.PWMPeriodMax1;     //最大周期为Prd-DeadTime
+    }
+    else
+    {
+        fx6 = ACRCom.PWMPeriodMax;      //最大周期为Pr
+    }
+    fx7 = ACRCom.PWMPeriodMin;           //最小周期为DeadTime
+
+    fx2 = fx2 > fx6 ? fx6 : fx2;
+    fx2 = fx2 < fx7 ? fx7 : fx2;
+
+    fx3 = fx3 > fx6 ? fx6 : fx3;
+    fx3 = fx3 < fx7 ? fx7 : fx3;
+
+    fx4 = fx4 > fx6 ? fx6 : fx4;
+    fx4 = fx4 < fx7 ? fx7 : fx4;
+ #if 0
+    fx2 = 4695.0f;
+    fx3 = 4546.0f;
+    fx4 = 4784.0f;
+#endif
+    /*8.更新EPWM比较值，EPwm1/2/3Regs.CMPA.CMPA 更新比较寄存器值*/
+    //TODO
+    HWREGH(0x306B) = (uint16_t)fx2;
+    HWREGH(0x326B) = (uint16_t)fx3;
+    HWREGH(0x346B) = (uint16_t)fx4;
+    //A1ToC1V.Monitor2 = fx2;
+    //A1ToC1V.Monitor3 = fx3;
+    //A1ToC1V.Monitor4 = fx4;
+
+
+    /*9.U,V,W三相最大占空比限制状态获取，根据当前周期的限制状态在下个周期的下三桥采集中执行*/
+    fx6 = ACRCom.ADCSample;
+    kx1 = ( fx2 >= fx6 ) ? 1 : 0;
+    kx2 = ( fx3 >= fx6 ) ? 2 : 0;
+    kx3 = ( fx4 >= fx6 ) ? 4 : 0;
+
+    AMotVar[0].PWMStatus = kx1 | kx2 | kx3;
+    return;
+}
+  
+  
+/**********************************************************************************************/
+/* Function_Name: Cla1Task1         */
+/* Description  : CLA中断处理任务1：轴1的电流环控制与ADC采集信号处理
+                  调用：每个PWM周期执行一次，执行时间3~4us
+                  输入：
+                  输出：   */
+/**********************************************************************************************/
+__attribute__((interrupt)) void Cla1Task1 ( void )
+{
+    //TODO 清除中断要提前，不然无法有效清除中断源？
+    //清除ADC采集中断源
+
+    //HWREG( GPIODATA_BASE + GPIO_O_GPBTOGGLE )   = 1UL ;
+    AMotVar[0].f.PWMDir1 = HWREGH(EPWM1_BASE + EPWM_O_TBSTS) & EPWM_TBSTS_CTRDIR;
+      
+ #if ( CLADebug == 0 )
+    ACR_MainTask( 0 , AMotVar[0].f.PWMDir1 );
+
+#endif
+
+
+     //U,V,W电流 Q14->3.3V ,监控用
+//    AMotVar[ 0 ].Iuu = (HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER0 ) +\
+//                        HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER1 )) >> 3;
+//    AMotVar[ 0 ].Ivv = (HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER0 ) +\
+//                        HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER1 )) >> 3;
+//    AMotVar[ 0 ].Iww = (HWREGH( ADCCRESULT_BASE + ADC_SOC_NUMBER0 ) +\
+//                        HWREGH( ADCCRESULT_BASE + ADC_SOC_NUMBER1 )) >> 3;
+    //模块温度  Q12->3.3V
+    AMotVar[0].IGBTTemp     = HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER6 ) >> 4;
+    //芯片温度  Q16->3.3V
+    A1ToC1V.DspCoreTemp     = HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER7 );
+
+    //母线电压  Q12->3.3V
+    AMotVar[0].Mot_Udc      = HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER7 ) >> 4;
+    //驱动类型 Q12->3.3V
+    AMotVar[0].DriveType    = HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER6 ) >> 4;
+
+    //霍尔信号
+    AMotVar[0].HallBSIN     = (HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER2 )+ HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER3 )+ HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER4 )+ HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER5 ))>>2;
+    AMotVar[0].HallBCOS     = (HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER2 )+ HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER3 )+ HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER4 )+ HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER5 ))>>2;
+ #if 0
+    else
+    {
+        PWMEndRec = HWREGH(EPWM1_BASE + EPWM_O_TBCTR);
+        if( 1 == AMotVar[0].f.PWMDir1 )
+        {
+            A1ToC1V.ACRExeTime = 0.01f * ( PWMEndRec - PWMStartRec );
+        }
+    }
+#endif
+
+    //清除ADC采集中断源
+    ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
+    if(true == ADC_getInterruptOverflowStatus(ADCA_BASE, ADC_INT_NUMBER1))
+    {
+        ADC_clearInterruptOverflowStatus(ADCA_BASE, ADC_INT_NUMBER1);
+        ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
+    }
+
+
+}
+  
+  
+  
+/**********************************************************************************************/
+/* Function_Name: Cla1Task2         */
+/* Description  : CLA中断处理任务2：轴2的电流环控制与ADC采集信号处理
+                  调用：每个PWM周期执行一次，执行时间3~4us
+                  输入：
+                  输出：   */
+/**********************************************************************************************/
+__attribute__((interrupt))  void Cla1Task2 ( void )
+{
+  /*
+    //获取EPWM计数器计数方向，确定是前上半周周期还是后半周周期
+    AMotVar[1].f.PWMDir1 = HWREGH(EPWM5_BASE + EPWM_O_TBSTS) & EPWM_TBSTS_CTRDIR;
+#if ( CLADebug == 0 )
+    ACR_MainTask( 1 , AMotVar[1].f.PWMDir1 );
+#endif
+    AMotVar[ 1 ].Iuu = (HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER4 ) +\
+                        HWREGH( ADCARESULT_BASE + ADC_SOC_NUMBER5 )) >> 3;
+    AMotVar[ 1 ].Ivv = (HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER4 ) +\
+                        HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER5 )) >> 3;
+    AMotVar[ 1 ].Iww = (HWREGH( ADCCRESULT_BASE + ADC_SOC_NUMBER4 ) +\
+                        HWREGH( ADCCRESULT_BASE + ADC_SOC_NUMBER5 )) >> 3;
+    AMotVar[1].Mot_Udc      = HWREGH( ADCBRESULT_BASE + ADC_SOC_NUMBER6 ) >> 4;          
+    AMotVar[1].IGBTTemp     = HWREGH( ADCCRESULT_BASE + ADC_SOC_NUMBER6 ) >> 4;
+      
+      
+    ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER2);
+    if(true == ADC_getInterruptOverflowStatus(ADCA_BASE, ADC_INT_NUMBER2))
+    {
+        ADC_clearInterruptOverflowStatus(ADCA_BASE, ADC_INT_NUMBER2);
+        ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER2);
+    }*/
+}
+  
+  
+  
+
+/**********************************************************************************************/
+/* Function_Name: Cla1Task6         */
+/* Description  : CLA中断处理任务6
+                  调用：测试用
+                  输入：
+                  输出：   */
+/**********************************************************************************************/
+__attribute__((interrupt))  void Cla1Task6 ( void )
+{
+  
+ 
+}
+  
+  
+  
+/**********************************************************************************************/
+/* Function_Name: Cla1Task7         */
+/* Description  : CLA中断处理任务7
+                  调用：测试用
+                  输入：
+                  输出：   */
+/**********************************************************************************************/
+__attribute__((interrupt))  void Cla1Task7 ( void )
+{
+  
+ 
+}
+  
+  
+  
+/**********************************************************************************************/
+/* Function_Name: Cla1Task8         */
+/* Description  : CLA中断处理任务8：背景任务（在CLA循环执行，有CLA TASK1~CLA7可以打断TASK8）
+                  调用：测试用
+                  输入：
+                  输出：   */
+/**********************************************************************************************/
+
+__attribute__((interrupt))  void Cla1Task8 ( void )
+{
+  
+    A1ToC1V.ACRUpdateErr = 0;
+    A1ToC1V.ACRExeTime = 0.0f;
+ }
+
+#endif
+ 
+
